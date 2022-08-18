@@ -26,8 +26,6 @@
 
 #define MAX_BATCH_LEN 256
 
-#define CPU_COPY_THRESHOLD_LEN 256
-
 static __rte_always_inline uint16_t
 async_poll_dequeue_completed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mbuf **pkts, uint16_t count, int16_t dma_id,
@@ -169,7 +167,7 @@ vhost_async_cpu_transfer_one(struct vhost_virtqueue *vq, uint16_t flag_idx,
 static __rte_always_inline uint16_t
 vhost_async_dma_transfer(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		int16_t dma_id, uint16_t vchan_id, uint16_t head_idx,
-		struct vhost_iov_iter *pkts, uint16_t nr_pkts)
+		struct vhost_iov_iter *pkts, uint16_t nr_pkts, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 {
 	struct async_dma_vchan_info *dma_info = &dma_copy_track[dma_id].vchans[vchan_id];
@@ -179,7 +177,7 @@ vhost_async_dma_transfer(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	rte_spinlock_lock(&dma_info->dma_lock);
 
 	for (pkt_idx = 0; pkt_idx < nr_pkts; pkt_idx++) {
-		if (pkts[pkt_idx].nr_len > CPU_COPY_THRESHOLD_LEN) {
+		if (pkts[pkt_idx].nr_len > dma_copy_threshold) {
 			ret = vhost_async_dma_transfer_one(dev, vq, dma_id, vchan_id, head_idx,
 					&pkts[pkt_idx]);
 		} else {
@@ -1828,9 +1826,9 @@ store_dma_desc_info_split(struct vring_used_elem *s_ring, struct vring_used_elem
 
 static __rte_noinline uint32_t
 virtio_dev_rx_async_submit_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
-	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id)
+	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id,
+	uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
-	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	struct buf_vector buf_vec[BUF_VECTOR_MAX];
 	uint32_t pkt_idx = 0;
@@ -1884,7 +1882,7 @@ virtio_dev_rx_async_submit_split(struct virtio_net *dev, struct vhost_virtqueue 
 		return 0;
 
 	n_xfer = vhost_async_dma_transfer(dev, vq, dma_id, vchan_id, async->pkts_idx,
-			async->iov_iter, pkt_idx);
+			async->iov_iter, pkt_idx, dma_copy_threshold);
 
 	pkt_err = pkt_idx - n_xfer;
 	if (unlikely(pkt_err)) {
@@ -2132,9 +2130,9 @@ dma_error_handler_packed(struct vhost_virtqueue *vq, uint16_t slot_idx,
 
 static __rte_noinline uint32_t
 virtio_dev_rx_async_submit_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
-	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id)
+	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id,
+	uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
-	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	uint32_t pkt_idx = 0;
 	uint16_t n_xfer;
@@ -2184,7 +2182,7 @@ virtio_dev_rx_async_submit_packed(struct virtio_net *dev, struct vhost_virtqueue
 		return 0;
 
 	n_xfer = vhost_async_dma_transfer(dev, vq, dma_id, vchan_id, async->pkts_idx,
-			async->iov_iter, pkt_idx);
+			async->iov_iter, pkt_idx, dma_copy_threshold);
 
 	async_iter_reset(async);
 
@@ -2544,7 +2542,8 @@ out_access_unlock:
 
 static __rte_always_inline uint32_t
 virtio_dev_rx_async_submit(struct virtio_net *dev, struct vhost_virtqueue *vq,
-	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id)
+	struct rte_mbuf **pkts, uint32_t count, int16_t dma_id, uint16_t vchan_id,
+	uint16_t dma_copy_threshold)
 {
 	uint32_t nb_tx = 0;
 
@@ -2574,11 +2573,11 @@ virtio_dev_rx_async_submit(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		goto out;
 
 	if (vq_is_packed(dev))
-		nb_tx = virtio_dev_rx_async_submit_packed(dev, vq, pkts, count,
-			dma_id, vchan_id);
+		nb_tx = virtio_dev_rx_async_submit_packed(dev, vq,
+				pkts, count, dma_id, vchan_id, dma_copy_threshold);
 	else
-		nb_tx = virtio_dev_rx_async_submit_split(dev, vq, pkts, count,
-			dma_id, vchan_id);
+		nb_tx = virtio_dev_rx_async_submit_split(dev, vq,
+				pkts, count, dma_id, vchan_id, dma_copy_threshold);
 
 	vq->stats.inflight_submitted += nb_tx;
 
@@ -2594,7 +2593,7 @@ out_access_unlock:
 uint16_t
 rte_vhost_submit_enqueue_burst(int vid, uint16_t queue_id,
 		struct rte_mbuf **pkts, uint16_t count, int16_t dma_id,
-		uint16_t vchan_id)
+		uint16_t vchan_id, uint16_t dma_copy_threshold)
 {
 	struct virtio_net *dev = get_device(vid);
 
@@ -2616,7 +2615,7 @@ rte_vhost_submit_enqueue_burst(int vid, uint16_t queue_id,
 	}
 
 	return virtio_dev_rx_async_submit(dev, dev->virtqueue[queue_id], pkts, count,
-		dma_id, vchan_id);
+		dma_id, vchan_id, dma_copy_threshold);
 }
 
 static inline bool
@@ -3737,7 +3736,7 @@ async_poll_dequeue_completed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 static __rte_always_inline uint16_t
 virtio_dev_tx_async_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts, uint16_t count,
-		int16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags)
+		int16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
@@ -3845,7 +3844,7 @@ virtio_dev_tx_async_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		rte_pktmbuf_free_bulk(&pkts_prealloc[pkt_idx], count - pkt_idx);
 
 	n_xfer = vhost_async_dma_transfer(dev, vq, dma_id, vchan_id, async->pkts_idx,
-					  async->iov_iter, pkt_idx);
+					  async->iov_iter, pkt_idx, dma_copy_threshold);
 
 	async->pkts_inflight_n += n_xfer;
 
@@ -3886,12 +3885,12 @@ static uint16_t
 virtio_dev_tx_async_split_legacy(struct virtio_net *dev,
 		struct vhost_virtqueue *vq, struct rte_mempool *mbuf_pool,
 		struct rte_mbuf **pkts, uint16_t count,
-		int16_t dma_id, uint16_t vchan_id)
+		int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	return virtio_dev_tx_async_split(dev, vq, mbuf_pool,
-				pkts, count, dma_id, vchan_id, true);
+				pkts, count, dma_id, vchan_id, true, dma_copy_threshold);
 }
 
 __rte_noinline
@@ -3899,12 +3898,12 @@ static uint16_t
 virtio_dev_tx_async_split_compliant(struct virtio_net *dev,
 		struct vhost_virtqueue *vq, struct rte_mempool *mbuf_pool,
 		struct rte_mbuf **pkts, uint16_t count,
-		int16_t dma_id, uint16_t vchan_id)
+		int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	return virtio_dev_tx_async_split(dev, vq, mbuf_pool,
-				pkts, count, dma_id, vchan_id, false);
+				pkts, count, dma_id, vchan_id, false, dma_copy_threshold);
 }
 
 static __rte_always_inline void
@@ -4044,9 +4043,9 @@ virtio_dev_tx_async_packed_batch(struct virtio_net *dev,
 static __rte_always_inline uint16_t
 virtio_dev_tx_async_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags)
+		uint16_t count, uint16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags,
+		uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
-	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	uint32_t pkt_idx = 0;
 	uint16_t slot_idx = 0;
@@ -4102,7 +4101,7 @@ virtio_dev_tx_async_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	} while (pkt_idx < count);
 
 	n_xfer = vhost_async_dma_transfer(dev, vq, dma_id, vchan_id, async->pkts_idx,
-					async->iov_iter, pkt_idx);
+					async->iov_iter, pkt_idx, dma_copy_threshold);
 
 	async->pkts_inflight_n += n_xfer;
 
@@ -4155,30 +4154,30 @@ __rte_noinline
 static uint16_t
 virtio_dev_tx_async_packed_legacy(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id)
+		uint16_t count, uint16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	return virtio_dev_tx_async_packed(dev, vq, mbuf_pool,
-				pkts, count, dma_id, vchan_id, true);
+				pkts, count, dma_id, vchan_id, true, dma_copy_threshold);
 }
 
 __rte_noinline
 static uint16_t
 virtio_dev_tx_async_packed_compliant(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id)
+		uint16_t count, uint16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
 	return virtio_dev_tx_async_packed(dev, vq, mbuf_pool,
-				pkts, count, dma_id, vchan_id, false);
+				pkts, count, dma_id, vchan_id, false, dma_copy_threshold);
 }
 
 uint16_t
 rte_vhost_async_try_dequeue_burst(int vid, uint16_t queue_id,
 	struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts, uint16_t count,
-	int *nr_inflight, int16_t dma_id, uint16_t vchan_id)
+	int *nr_inflight, int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 {
 	struct virtio_net *dev;
 	struct rte_mbuf *rarp_mbuf = NULL;
@@ -4280,17 +4279,17 @@ rte_vhost_async_try_dequeue_burst(int vid, uint16_t queue_id,
 	if (vq_is_packed(dev)) {
 		if (dev->flags & VIRTIO_DEV_LEGACY_OL_FLAGS)
 			count = virtio_dev_tx_async_packed_legacy(dev, vq, mbuf_pool,
-					pkts, count, dma_id, vchan_id);
+					pkts, count, dma_id, vchan_id, dma_copy_threshold);
 		else
 			count = virtio_dev_tx_async_packed_compliant(dev, vq, mbuf_pool,
-					pkts, count, dma_id, vchan_id);
+					pkts, count, dma_id, vchan_id, dma_copy_threshold);
 	} else {
 		if (dev->flags & VIRTIO_DEV_LEGACY_OL_FLAGS)
 			count = virtio_dev_tx_async_split_legacy(dev, vq, mbuf_pool,
-					pkts, count, dma_id, vchan_id);
+					pkts, count, dma_id, vchan_id, dma_copy_threshold);
 		else
 			count = virtio_dev_tx_async_split_compliant(dev, vq, mbuf_pool,
-					pkts, count, dma_id, vchan_id);
+					pkts, count, dma_id, vchan_id, dma_copy_threshold);
 	}
 
 	*nr_inflight = vq->async->pkts_inflight_n;

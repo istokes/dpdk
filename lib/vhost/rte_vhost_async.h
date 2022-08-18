@@ -98,7 +98,7 @@ int rte_vhost_async_channel_unregister_thread_unsafe(int vid,
 __rte_experimental
 uint16_t rte_vhost_submit_enqueue_burst(int vid, uint16_t queue_id,
 		struct rte_mbuf **pkts, uint16_t count, int16_t dma_id,
-		uint16_t vchan_id);
+		uint16_t vchan_id, uint16_t dma_copy_threshold);
 
 /**
  * This function checks async completion status for a specific vhost
@@ -264,7 +264,7 @@ __rte_experimental
 uint16_t
 rte_vhost_async_try_dequeue_burst(int vid, uint16_t queue_id,
 	struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts, uint16_t count,
-	int *nr_inflight, int16_t dma_id, uint16_t vchan_id);
+	int *nr_inflight, int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold);
 
 /**
  * @warning
