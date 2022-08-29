@@ -146,8 +146,10 @@ struct virtqueue_stats {
  * iovec
  */
 struct vhost_iovec {
-	void *src_addr;
-	void *dst_addr;
+	void *src_iov_addr;
+	void *dst_iov_addr;
+	void *src_virt_addr;
+	void *dst_virt_addr;
 	size_t len;
 };
 
@@ -159,6 +161,7 @@ struct vhost_iov_iter {
 	struct vhost_iovec *iov;
 	/** number of iovec in this iterator */
 	unsigned long nr_segs;
+	unsigned long nr_len;
 };
 
 struct async_dma_vchan_info {
