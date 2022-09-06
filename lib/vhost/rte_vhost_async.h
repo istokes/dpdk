@@ -14,6 +14,8 @@ extern "C" {
 #include <rte_compat.h>
 #include <rte_mbuf.h>
 
+#define RTE_VHOST_ASYNC_DMA_FALLBACK (-1)
+
 /**
  * Register an async channel for a vhost queue
  *

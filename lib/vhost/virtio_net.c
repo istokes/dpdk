@@ -167,11 +167,23 @@ vhost_async_dma_transfer(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct vhost_iov_iter *pkts, uint16_t nr_pkts, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 {
-	struct async_dma_vchan_info *dma_info = &dma_copy_track[dma_id].vchans[vchan_id];
-	int64_t ret, nr_copies = 0;
+	struct async_dma_vchan_info *dma_info = NULL;
+	int64_t ret, nr_dma_enq = 0;
 	uint16_t pkt_idx;
 	uint16_t dma_cap;
 
+	if (dma_id == RTE_VHOST_ASYNC_DMA_FALLBACK) {
+		/* Special DMA id case, perform CPU copy over entire burst. */
+		for (pkt_idx = 0; pkt_idx < nr_pkts; pkt_idx++) {
+			vhost_async_cpu_transfer_one(vq, head_idx, &pkts[pkt_idx]);
+			head_idx++;
+			if (head_idx >= vq->size)
+				head_idx -= vq->size;
+		}
+		return pkt_idx;
+	}
+
+	dma_info = &dma_copy_track[dma_id].vchans[vchan_id];
 	rte_spinlock_lock(&dma_info->dma_lock);
 	dma_cap = rte_dma_burst_capacity(dma_id, vchan_id);
 
@@ -188,13 +200,13 @@ vhost_async_dma_transfer(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		if (unlikely(ret < 0))
 			break;
 
-		nr_copies += ret;
+		nr_dma_enq += ret;
 		head_idx++;
 		if (head_idx >= vq->size)
 			head_idx -= vq->size;
 	}
 
-	if (likely(nr_copies > 0))
+	if (likely(nr_dma_enq > 0))
 		rte_dma_submit(dma_id, vchan_id);
 
 	rte_spinlock_unlock(&dma_info->dma_lock);
@@ -2312,8 +2324,9 @@ vhost_poll_enqueue_completed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	uint16_t n_descs = 0, n_buffers = 0;
 	uint16_t start_idx, from, i;
 
-	/* Check completed copies for the given DMA vChannel */
-	vhost_async_dma_check_completed(dev, dma_id, vchan_id, VHOST_DMA_MAX_COPY_COMPLETE);
+	if (dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK)
+		/* Check completed copies for the given DMA vChannel */
+		vhost_async_dma_check_completed(dev, dma_id, vchan_id, VHOST_DMA_MAX_COPY_COMPLETE);
 
 	start_idx = async_get_first_inflight_pkt_idx(vq);
 	/**
@@ -2388,7 +2401,7 @@ rte_vhost_poll_enqueue_completed(int vid, uint16_t queue_id,
 		return 0;
 	}
 
-	if (unlikely(!dma_copy_track[dma_id].vchans ||
+	if ((dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK) && unlikely(!dma_copy_track[dma_id].vchans ||
 				!dma_copy_track[dma_id].vchans[vchan_id].pkts_cmpl_flag_addr)) {
 		VHOST_LOG_DATA(dev->ifname, ERR,
 			"%s: invalid channel %d:%u.\n",
@@ -2442,7 +2455,8 @@ rte_vhost_clear_queue_thread_unsafe(int vid, uint16_t queue_id,
 		return 0;
 	}
 
-	if (unlikely(dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX)) {
+	if (unlikely((dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX))
+			&& (dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK)) {
 		VHOST_LOG_DATA(dev->ifname, ERR, "%s: invalid dma id %d.\n",
 			__func__, dma_id);
 		return 0;
@@ -2459,7 +2473,7 @@ rte_vhost_clear_queue_thread_unsafe(int vid, uint16_t queue_id,
 		return 0;
 	}
 
-	if (unlikely(!dma_copy_track[dma_id].vchans ||
+	if ((dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK) && unlikely(!dma_copy_track[dma_id].vchans ||
 				!dma_copy_track[dma_id].vchans[vchan_id].pkts_cmpl_flag_addr)) {
 		VHOST_LOG_DATA(dev->ifname, ERR,
 			"%s: invalid channel %d:%u.\n",
@@ -2498,7 +2512,8 @@ rte_vhost_clear_queue(int vid, uint16_t queue_id, struct rte_mbuf **pkts,
 		return 0;
 	}
 
-	if (unlikely(dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX)) {
+	if (unlikely(dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX)
+			&& (dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK)) {
 		VHOST_LOG_DATA(dev->ifname, ERR, "%s: invalid dma id %d.\n",
 			__func__, dma_id);
 		return 0;
@@ -2518,7 +2533,7 @@ rte_vhost_clear_queue(int vid, uint16_t queue_id, struct rte_mbuf **pkts,
 		goto out_access_unlock;
 	}
 
-	if (unlikely(!dma_copy_track[dma_id].vchans ||
+	if ((dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK) && unlikely(!dma_copy_track[dma_id].vchans ||
 				!dma_copy_track[dma_id].vchans[vchan_id].pkts_cmpl_flag_addr)) {
 		VHOST_LOG_DATA(dev->ifname, ERR, "%s: invalid channel %d:%u.\n",
 			__func__, dma_id, vchan_id);
@@ -2550,7 +2565,7 @@ virtio_dev_rx_async_submit(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	VHOST_LOG_DATA(dev->ifname, DEBUG, "%s\n", __func__);
 
-	if (unlikely(!dma_copy_track[dma_id].vchans ||
+	if ((dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK) && unlikely(!dma_copy_track[dma_id].vchans ||
 				!dma_copy_track[dma_id].vchans[vchan_id].pkts_cmpl_flag_addr)) {
 		VHOST_LOG_DATA(dev->ifname, ERR,
 			"%s: invalid channel %d:%u.\n",
@@ -3697,7 +3712,8 @@ async_poll_dequeue_completed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	uint16_t nr_cpl_pkts = 0;
 	struct async_inflight_info *pkts_info = vq->async->pkts_info;
 
-	vhost_async_dma_check_completed(dev, dma_id, vchan_id, VHOST_DMA_MAX_COPY_COMPLETE);
+	if (dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK)
+		vhost_async_dma_check_completed(dev, dma_id, vchan_id, VHOST_DMA_MAX_COPY_COMPLETE);
 
 	start_idx = async_get_first_inflight_pkt_idx(vq);
 
@@ -4044,7 +4060,7 @@ virtio_dev_tx_async_packed_batch(struct virtio_net *dev,
 static __rte_always_inline uint16_t
 virtio_dev_tx_async_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags,
+		uint16_t count, int16_t dma_id, uint16_t vchan_id, bool legacy_ol_flags,
 		uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 {
@@ -4155,7 +4171,7 @@ __rte_noinline
 static uint16_t
 virtio_dev_tx_async_packed_legacy(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
+		uint16_t count, int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
@@ -4167,7 +4183,7 @@ __rte_noinline
 static uint16_t
 virtio_dev_tx_async_packed_compliant(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts,
-		uint16_t count, uint16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
+		uint16_t count, int16_t dma_id, uint16_t vchan_id, uint16_t dma_copy_threshold)
 	__rte_exclusive_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
@@ -4203,13 +4219,14 @@ rte_vhost_async_try_dequeue_burst(int vid, uint16_t queue_id,
 		return 0;
 	}
 
-	if (unlikely(dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX)) {
+	if (unlikely(dma_id < 0 || dma_id >= RTE_DMADEV_DEFAULT_MAX)
+			&& (dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK)) {
 		VHOST_LOG_DATA(dev->ifname, ERR, "%s: invalid dma id %d.\n",
 			__func__, dma_id);
 		return 0;
 	}
 
-	if (unlikely(!dma_copy_track[dma_id].vchans ||
+	if ((dma_id != RTE_VHOST_ASYNC_DMA_FALLBACK) && unlikely(!dma_copy_track[dma_id].vchans ||
 				!dma_copy_track[dma_id].vchans[vchan_id].pkts_cmpl_flag_addr)) {
 		VHOST_LOG_DATA(dev->ifname, ERR, "%s: invalid channel %d:%u.\n",
 			__func__, dma_id, vchan_id);
