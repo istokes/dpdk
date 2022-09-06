@@ -114,9 +114,6 @@ vhost_async_dma_transfer_one(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	uint32_t nr_segs = pkt->nr_segs;
 	uint16_t i;
 
-	if (rte_dma_burst_capacity(dma_id, vchan_id) < nr_segs)
-		return -1;
-
 	for (i = 0; i < nr_segs; i++) {
 		copy_idx = rte_dma_copy(dma_id, vchan_id, (rte_iova_t)iov[i].src_iov_addr,
 				(rte_iova_t)iov[i].dst_iov_addr, iov[i].len, RTE_DMA_OP_FLAG_LLC);
@@ -173,14 +170,18 @@ vhost_async_dma_transfer(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	struct async_dma_vchan_info *dma_info = &dma_copy_track[dma_id].vchans[vchan_id];
 	int64_t ret, nr_copies = 0;
 	uint16_t pkt_idx;
+	uint16_t dma_cap;
 
 	rte_spinlock_lock(&dma_info->dma_lock);
+	dma_cap = rte_dma_burst_capacity(dma_id, vchan_id);
 
 	for (pkt_idx = 0; pkt_idx < nr_pkts; pkt_idx++) {
-		if (pkts[pkt_idx].nr_len > dma_copy_threshold) {
+		if ((pkts[pkt_idx].nr_len > dma_copy_threshold) && (dma_cap >= pkts[pkt_idx].nr_segs)) {
 			ret = vhost_async_dma_transfer_one(dev, vq, dma_id, vchan_id, head_idx,
 					&pkts[pkt_idx]);
+			dma_cap -= pkts[pkt_idx].nr_segs;
 		} else {
+			/* CPU copy if packet is neither beyond threshold nor DMA has enough capacity. */
 			ret = vhost_async_cpu_transfer_one(vq, head_idx, &pkts[pkt_idx]);
 		}
 
